@@ -1,0 +1,48 @@
+{
+  "name": "limitbreak",
+  "version": "0.1.0",
+  "description": "Never hit the wall. The quota governor for LLM usage limits: meters your remaining budget, forecasts when you'll run out, and escalates optimization only as you approach the limit — so you finish the task instead of getting cut off.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "limitbreak": "./dist/cli.js",
+    "lb": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "playbooks",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node test/smoke.mjs && node test/governor.mjs && node test/compress.mjs && node test/mcp.mjs && node test/calibrate.mjs && node test/report.mjs && node test/backends.mjs && node test/runway.mjs && node test/guardrails.mjs && node test/dashboard.mjs && node test/memory.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "llm",
+    "usage-limits",
+    "quota",
+    "context-compression",
+    "prompt-caching",
+    "model-routing",
+    "anthropic",
+    "openai",
+    "gemini",
+    "claude-code",
+    "proxy"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "typescript": "^5.9.3"
+  }
+}
