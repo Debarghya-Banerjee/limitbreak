@@ -18,6 +18,15 @@ import { runMcpStdio } from "./mcp.js";
 import { createProxy } from "./proxy.js";
 import { computeRunway, formatDuration } from "./runway.js";
 import { Store } from "./store.js";
+import {
+  buildTeamReport,
+  DEFAULT_ROLES,
+  formatLease,
+  formatPlan,
+  leasePressure,
+  Team,
+  type Complexity,
+} from "./team.js";
 import { aggregateUsage, parseDuration } from "./telemetry.js";
 
 /** Tokens limitbreak saved (compression + shaping + dropped context) in the last `ms`. */
@@ -26,11 +35,10 @@ function savedTokensSince(logPath: string, ms: number): number {
   return r.compressionSavedTokens + r.shapingSavedTokens + r.droppedContextTokens;
 }
 
-const PLAYBOOKS_DIR = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "playbooks",
-);
+const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const PLAYBOOKS_DIR = join(PKG_ROOT, "playbooks");
+const AGENTS_DIR = join(PKG_ROOT, "agents");
+const TEAM_SKILL_DIR = join(PKG_ROOT, "skills", "team");
 
 const START = "<!-- limitbreak:start -->";
 const END = "<!-- limitbreak:end -->";
@@ -361,6 +369,166 @@ function memoryCmd(args: string[]): void {
   }
 }
 
+const COMPLEXITIES: Complexity[] = ["trivial", "small", "medium", "large"];
+
+/** Remaining tokens in the tightest window — what a team is actually staffed against. */
+function poolTokens(): number {
+  const settings = loadSettings();
+  const ledger = new Ledger(globalLogPath());
+  const eff = ledger.effectiveSettings(settings);
+  const worst = assess(ledger.forecasts(eff), eff).worst;
+  if (!worst) return 0;
+  return Math.max(0, worst.window.budgetTokens - worst.usedTokens);
+}
+
+function teamCmd(args: string[]): void {
+  const settings = loadSettings();
+  const team = new Team(join(configDir(), "team.jsonl"), settings.team);
+  const [sub, ...rest] = args;
+
+  switch (sub ?? "status") {
+    case "init": {
+      // Role definitions and the manager skill are Claude Code assets, so they
+      // install into .claude/ rather than .limitbreak/ — globally by default so
+      // a team is available in every project, not just this one.
+      const base = rest.includes("--project") ? process.cwd() : homedir();
+      const agentsDest = join(base, ".claude", "agents");
+      mkdirSync(agentsDest, { recursive: true });
+      const installed: string[] = [];
+      for (const f of readdirSync(AGENTS_DIR)) {
+        if (!f.endsWith(".md")) continue;
+        copyFileSync(join(AGENTS_DIR, f), join(agentsDest, f));
+        installed.push(f.replace(/\.md$/, ""));
+      }
+      const skillDest = join(base, ".claude", "skills", "team");
+      mkdirSync(skillDest, { recursive: true });
+      for (const f of readdirSync(TEAM_SKILL_DIR)) {
+        if (f.endsWith(".md")) copyFileSync(join(TEAM_SKILL_DIR, f), join(skillDest, f));
+      }
+      console.log(`✓ roles → ${agentsDest}/  (${installed.sort().join(", ")})`);
+      console.log(`✓ manager skill → ${skillDest}/`);
+      console.log(`\nRegister the MCP server so agents can draw on their leases:`);
+      console.log(`  claude mcp add limitbreak -- limitbreak mcp`);
+      console.log(`\nThen run a team with:  /team <goal>`);
+      return;
+    }
+    case "plan": {
+      const words: string[] = [];
+      let complexity: Complexity = "medium";
+      let width: number | undefined;
+      let budget: number | undefined;
+      let dry = false;
+      for (let i = 0; i < rest.length; i++) {
+        const a = rest[i];
+        if (a === undefined) continue;
+        if (a === "--dry-run") dry = true;
+        else if (a === "--complexity") {
+          const v = rest[++i];
+          if (!v || !COMPLEXITIES.includes(v as Complexity)) {
+            console.error(`invalid --complexity "${v ?? ""}" — use one of ${COMPLEXITIES.join(", ")}`);
+            process.exit(1);
+          }
+          complexity = v as Complexity;
+        } else if (a === "--width") {
+          width = Number(rest[++i]);
+          if (!Number.isFinite(width) || width < 1) {
+            console.error("--width must be a positive number of independent work units");
+            process.exit(1);
+          }
+        } else if (a === "--budget") {
+          budget = Number(rest[++i]);
+          if (!Number.isFinite(budget) || budget <= 0) {
+            console.error("--budget must be a positive token count");
+            process.exit(1);
+          }
+        } else if (!a.startsWith("--")) words.push(a);
+      }
+      const goal = words.join(" ");
+      if (!goal.trim()) {
+        console.error("usage: limitbreak team plan <goal> [--complexity trivial|small|medium|large] [--width N] [--budget N] [--dry-run]");
+        process.exit(1);
+      }
+      const available = budget ?? poolTokens();
+      const plan = team.plan({
+        goal,
+        complexity,
+        ...(width !== undefined && { parallelWidth: width }),
+        availableTokens: available,
+      });
+      console.log(`pool: ${fmt(available)} tokens available${budget === undefined ? " (remaining quota)" : ""}\n`);
+      console.log(formatPlan(plan));
+      if (!plan.feasible) {
+        console.log("\nNot feasible — cut the scope, wait for the window to recover, or pass --budget deliberately.");
+        process.exit(1);
+      }
+      if (dry) {
+        console.log("\ndry run — no leases opened");
+        return;
+      }
+      console.log("\nLeases opened:");
+      for (const l of team.openPlan(plan)) {
+        console.log(`  ${l.role} → ${l.id} · ${fmt(l.granted)} tokens · phase ${l.phase}`);
+      }
+      console.log(`\nGive each agent its own lease id. Track with: lb team status ${plan.runId}`);
+      return;
+    }
+    case "status": {
+      const runId = rest[0];
+      const leases = team.leases(runId);
+      if (leases.length === 0) {
+        console.log(runId ? `no leases for run ${runId}` : "no team leases recorded");
+        return;
+      }
+      for (const l of leases) {
+        console.log(`${formatLease(l)} [${leasePressure(l, settings.team)}]`);
+      }
+      if (runId) {
+        const { tokens, leases: done } = team.reclaimable(runId);
+        console.log(`\nreclaimable at next boundary: ${fmt(tokens)} tokens from ${done.length} finished lease(s)`);
+      }
+      return;
+    }
+    case "report": {
+      const r = buildTeamReport(team.leases(rest[0]));
+      if (r.leases === 0) {
+        console.log("No team runs recorded yet. Start one with: lb team plan <goal>");
+        return;
+      }
+      console.log(`limitbreak team — ${r.runs} run(s), ${r.leases} lease(s)\n`);
+      console.log(`  spent:        ${fmt(r.spent)} tokens of ${fmt(r.granted)} granted`);
+      console.log(`  reclaimed:    ${fmt(r.reclaimed)} tokens returned from unspent leases`);
+      console.log(`  accepted:     ${r.tasksAccepted} task(s) → ${r.acceptedPer100k.toFixed(2)} per 100k tokens`);
+      console.log(`  coordination: ${(r.managerOverheadPct * 100).toFixed(1)}% of spend went to the manager`);
+      console.log(`\n  role         leases   spent      est→actual`);
+      for (const [role, b] of Object.entries(r.byRole).sort()) {
+        const ratio = b.estimateToActual === null ? "—" : `${b.estimateToActual.toFixed(2)}x`;
+        console.log(
+          `  ${role.padEnd(12)} ${String(b.leases).padStart(6)}   ${fmt(b.spent).padStart(9)}   ${ratio.padStart(9)}`,
+        );
+      }
+      console.log(
+        "\n  est→actual above 1.00x means the role habitually overruns its grant; below means it is over-funded.",
+      );
+      return;
+    }
+    case "roles": {
+      console.log(`limitbreak team roles (size: ${settings.team.size}, maxAgents: ${settings.team.maxAgents}, reserve: ${(settings.team.reserve * 100).toFixed(0)}%)\n`);
+      console.log(`  role         pri/tier      grant(p80)   floor(p20)   samples`);
+      for (const spec of DEFAULT_ROLES) {
+        const e = team.estimate(spec.name);
+        console.log(
+          `  ${spec.name.padEnd(12)} ${`${spec.priority}/${spec.tier}`.padEnd(13)} ${fmt(e.p80).padStart(10)}   ${fmt(e.minViable).padStart(10)}   ${String(e.samples).padStart(7)}${e.source === "seed" ? " (seed)" : ""}`,
+        );
+      }
+      console.log("\n  Grants and floors switch from seeds to observed percentiles after 3 closed leases per role.");
+      return;
+    }
+    default:
+      console.error("usage: limitbreak team [init [--project]|plan <goal> [--complexity c] [--width N] [--budget N] [--dry-run]|status [runId]|report [runId]|roles]");
+      process.exit(1);
+  }
+}
+
 const WRAP_START = "# >>> limitbreak wrap >>>";
 const WRAP_END = "# <<< limitbreak wrap <<<";
 
@@ -437,6 +605,9 @@ switch (cmd) {
   case "memory":
     memoryCmd(process.argv.slice(3));
     break;
+  case "team":
+    teamCmd(process.argv.slice(3));
+    break;
   default:
     console.log(`limitbreak — never hit the wall. The quota governor for LLM usage limits.
 
@@ -446,9 +617,12 @@ Usage:
   limitbreak wrap claude|openai-app  route an agent/app through the daemon (--apply persists to shell rc)
   limitbreak unwrap                  remove the wrap block from the shell rc
   limitbreak retrieve <id>           print the original of a compressed block
-  limitbreak mcp                     run as an MCP server over stdio (status, retrieve, report, remember, recall tools)
+  limitbreak mcp                     run as an MCP server over stdio (status, retrieve, report, remember, recall, team tools)
   limitbreak memory [list|add <text> [--key k] [--tag t]|rm <id>]
                                      cross-agent memory: notes shared by every agent on this machine
+  limitbreak team init [--project]   install the role definitions + /team manager skill into .claude/ (global unless --project)
+  limitbreak team [plan <goal>|status [runId]|report [runId]|roles]
+                                     staff a multi-agent run against remaining quota: headcount, roles, per-agent token leases
   limitbreak init                    install playbooks + CLAUDE.md efficiency rules into this project
   limitbreak report [path] [--since 7d] [--markdown]
                                      usage + savings headline (tokens saved, runway gained); --markdown for a paste-ready summary

@@ -75,7 +75,18 @@ const text = (res) => res.result.content[0].text;
 {
   const res = handle({ jsonrpc: "2.0", id: 5, method: "tools/list" });
   const names = res.result.tools.map((t) => t.name);
-  assert.deepEqual(names, ["limitbreak_status", "limitbreak_retrieve", "limitbreak_remember", "limitbreak_recall", "limitbreak_report"]);
+  assert.deepEqual(names, [
+    "limitbreak_status",
+    "limitbreak_retrieve",
+    "limitbreak_remember",
+    "limitbreak_recall",
+    "limitbreak_report",
+    "limitbreak_team_plan",
+    "limitbreak_lease_spend",
+    "limitbreak_lease_close",
+    "limitbreak_team_status",
+    "limitbreak_team_report",
+  ]);
   for (const t of res.result.tools) assert.equal(t.inputSchema.type, "object");
 }
 
@@ -178,7 +189,7 @@ console.log("✓ mcp handler tests passed");
 
   const byId = Object.fromEntries(lines.map((l) => [l.id, l]));
   assert.equal(byId[1].result.protocolVersion, "2025-06-18");
-  assert.equal(byId[2].result.tools.length, 5);
+  assert.equal(byId[2].result.tools.length, 10);
   assert.equal(byId[3].result.content[0].text, "e2e original");
   assert.ok(byId[4].result.content[0].text.includes("150/1000"), "status uses HOME-based ledger");
   console.log("✓ mcp stdio e2e passed");

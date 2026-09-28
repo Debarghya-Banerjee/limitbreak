@@ -9,7 +9,7 @@ lb wrap claude    # route Claude Code through it
 lb status         # ● GREEN — 5h window 31.2%, exhausts in ~3h 40m at current burn
 ```
 
-Then open `http://localhost:8787/` for the live dashboard. Everything is local-first and zero-dependency: one daemon that meters, forecasts, optimizes under pressure, proves its savings — and gives all your agents a shared memory.
+Then open `http://localhost:8787/` for the live dashboard. Everything is local-first and zero-dependency: one daemon that meters, forecasts, optimizes under pressure, proves its savings, gives all your agents a shared memory — and staffs multi-agent runs against what's actually left in your window.
 
 ## The idea
 
@@ -104,6 +104,60 @@ Agents use the MCP tools (`limitbreak_remember` supports a stable `key` for upda
 
 **Playbooks** — `lb init` installs session-efficiency rules into a project's `CLAUDE.md` and drops usage guides in `.limitbreak/playbooks/`.
 
+## Teams — the governor for a fleet
+
+One agent against a quota window is a budget. *Several* agents against the same window is an **allocation problem**, and it's the one nobody solves: CrewAI, AutoGen and LangGraph orchestrate multi-agent work but govern nothing (`max_iterations` is the state of the art); compressors meter tokens but have no idea agents exist. limitbreak already knows what's left in the window, so it can decide who gets it.
+
+```sh
+lb team init                      # install roles + the /team manager skill into .claude/
+claude mcp add limitbreak -- limitbreak mcp
+```
+
+Then in Claude Code: `/team add retry logic to the router and cover it with tests`.
+
+The manager triages the goal, staffs it **against your remaining quota**, and hands each subagent its own token lease — planner, architect, developer, reviewer, each pinned to a tier (`lb team roles`). The same goal gets a full roster early in a window and a merged pair near the wall.
+
+```
+run 4cf2ef27c61b · 4 agents · 140000 tokens allocated (reserve 300000)
+  p1 planner   [P0/max]      25000 tok → context pack
+  p2 architect [P0/max]      30000 tok → design + file plan
+  p3 developer [P1/balanced] 60000 tok → diff
+  p4 reviewer  [P1/balanced] 25000 tok → verdict + findings
+```
+
+**Headcount is capped by budget, not by workload.** Unlike money or time, a task killed at 95% of its budget has *no salvage value* — you paid in full for an unusable artifact. So an agent below its working minimum doesn't degrade, it returns nothing: split 100k across ten agents needing 25k each and you get zero output for 100k spent. limitbreak derives each role's floor from the 20th percentile of its own successful runs and refuses to staff below it — **merging roles rather than underfunding them**, because one agent planning and building on 50k beats two starved agents on 25k each:
+
+```
+run b1eee742043f · 2 agents · 51000 tokens allocated (reserve 9000)
+  p3 developer +planner+architect [P1/balanced] 36000 tok → diff
+  p4 reviewer                     [P1/balanced] 15000 tok → verdict + findings
+  degraded: merged planner into architect rather than underfund both
+  note: funded at 36% of the full ask — expect tighter scoping
+```
+
+When the pool can't fund even a merged pair, it says so **before** a token is spent.
+
+**Estimates come from your ledger, never from asking a model.** Self-estimates run 3–5x low. limitbreak buckets closed leases by role and grants the p80 of actuals — the risk decision, not the average — then reconciles every run. Budgets are leases, not counters: they expire, so a crashed agent's grant returns to the pool instead of leaking, and an under-spender **funds the next hire** at the phase boundary.
+
+Pressure escalates per agent exactly as it does per window: **steer** at 70% ("converge now"), **checkpoint** at 90% ("emit a resumable artifact"), **stop** at 100%. The checkpoint step is what makes stopping survivable rather than a write-off.
+
+The trap this avoids: a subagent starts cold, so four agents each re-deriving the same repo understanding costs four times what one agent pays — a naive team is *worse* than a soloist. The **Context Pack** inverts that. The planner explores once and writes the brief; every later agent receives it verbatim as a stable prefix, so identical content is a cache read instead of fresh input tokens. Handoffs are the engineering problem; the budget math is the easy part.
+
+Because a coding fleet has ground truth a generic token tool doesn't — does it build, do the tests pass, what did the reviewer rule — `lb team report` can state **quality per token**, not just tokens saved:
+
+```
+  spent:        70,000 tokens of 85,000 granted
+  reclaimed:    15,000 tokens returned from unspent leases
+  accepted:     2 task(s) → 2.86 per 100k tokens
+  coordination: 8.0% of spend went to the manager
+
+  role         leases   spent      est→actual
+  developer         1      60,000       1.30x
+  reviewer          1      10,000       0.40x
+```
+
+The manager holds a lease like anyone else, so coordination overhead is **metered, not hidden** — it's the likeliest way a team turns out net-negative, and you can't catch it if you don't book it.
+
 ## Configuration
 
 `~/.limitbreak/config.json` — all keys optional. Providers don't publish subscription budgets, so if you leave `windows` unset limitbreak **auto-calibrates** them from observed 429s (never guessing above the hardest evidence); set `windows` explicitly to override, or `"autoCalibrate": false` to pin the defaults. `lb status` annotates which budgets are calibrated vs. placeholder.
@@ -121,9 +175,12 @@ Agents use the MCP tools (`limitbreak_remember` supports a stable `key` for upda
   "compressMinTokens": 500,
   "autoCalibrate": true,
   "downgrade": { "claude-opus-4-7": "claude-sonnet-4-6" },
-  "guardrails": { "enabled": true, "minSamples": 20, "errorMargin": 0.05, "truncationMargin": 0.05, "lookbackHours": 6 }
+  "guardrails": { "enabled": true, "minSamples": 20, "errorMargin": 0.05, "truncationMargin": 0.05, "lookbackHours": 6 },
+  "team": { "size": "auto", "maxAgents": 6, "minViableLease": "auto", "degradeWhenPoor": "merge", "reserve": 0.15 }
 }
 ```
+
+**Team sizing.** `size: "auto"` lets the manager pick the headcount; a number pins it. `maxAgents` is the ceiling either way — it's what stops a bad triage fanning out a dozen starved agents, so it matters more than the default. `minViableLease: "auto"` derives each role's floor from the 20th percentile of its own successful runs; set a number to pin it. `degradeWhenPoor` chooses what happens when the pool is short: `merge` collapses roles (the default), `serialize` runs every phase through one agent, `refuse` declines the run rather than trade roles away. `reserve` is held back for overruns and review-triggered rework.
 
 **Auto-revert guardrails** compare the shaped group against the 10% holdout over a trailing window: if shaping (or downgrade specifically) shows a higher provider-error rate, higher truncation rate, or fails to save tokens — beyond the margins, and only past `minSamples` per group — that policy is disabled and re-tested later. `lb status` flags any active revert. Set `"guardrails": { "enabled": false }` to pin policies on.
 
@@ -143,9 +200,15 @@ lb status                  quota level, usage bars, burn rate, exhaustion foreca
 lb wrap claude|openai-app  route an agent through the governor (--apply persists to shell rc)
 lb unwrap                  undo wrap
 lb retrieve <id>           print the original of any compressed block
-lb mcp                     run as an MCP server over stdio (status, retrieve, report, remember, recall tools)
+lb mcp                     run as an MCP server over stdio (status, retrieve, report, remember, recall, team tools)
 lb memory [list|add <text> [--key k] [--tag t]|rm <id>]
                            cross-agent memory: notes shared by every agent on this machine
+lb team init [--project]   install the role definitions + /team manager skill into .claude/ (global unless --project)
+lb team plan <goal> [--complexity trivial|small|medium|large] [--width N] [--budget N] [--dry-run]
+                           staff a run against remaining quota: headcount, roles, per-agent leases
+lb team status [runId]     live leases: spend vs grant, pressure, budget reclaimable at the next boundary
+lb team report [runId]     accepted work per 100k tokens, per-role overrun ratios, coordination overhead
+lb team roles              the org chart with current grants and floors (seeded, then observed)
 lb init                    install playbooks + CLAUDE.md rules into a project
 lb report [path] [--since 7d] [--markdown]
                            runway + savings headline (tokens saved, runway gained) + full breakdown; --markdown for a paste-ready summary
@@ -155,5 +218,5 @@ lb report [path] [--since 7d] [--markdown]
 
 ```sh
 npm run build   # tsc
-npm test        # build + every suite: smoke, governor, compression, mcp, calibrate, report, backends, runway, guardrails, dashboard, memory (no network; mock upstream)
+npm test        # build + every suite: smoke, governor, compression, mcp, calibrate, report, backends, runway, guardrails, dashboard, memory, team (no network; mock upstream)
 ```
