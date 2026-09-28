@@ -18,11 +18,13 @@
   "files": [
     "dist",
     "playbooks",
+    "agents",
+    "skills",
     "README.md"
   ],
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node test/smoke.mjs && node test/governor.mjs && node test/compress.mjs && node test/mcp.mjs && node test/calibrate.mjs && node test/report.mjs && node test/backends.mjs && node test/runway.mjs && node test/guardrails.mjs && node test/dashboard.mjs && node test/memory.mjs"
+    "test": "npm run build && node test/smoke.mjs && node test/governor.mjs && node test/compress.mjs && node test/mcp.mjs && node test/calibrate.mjs && node test/report.mjs && node test/backends.mjs && node test/runway.mjs && node test/guardrails.mjs && node test/dashboard.mjs && node test/memory.mjs && node test/team.mjs"
   },
   "engines": {
     "node": ">=18"

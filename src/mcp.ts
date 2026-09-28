@@ -8,12 +8,39 @@ import { configDir as defaultConfigDir, Ledger, loadSettings } from "./ledger.js
 import { formatEntry, Memory } from "./memory.js";
 import { computeRunway, formatDuration } from "./runway.js";
 import { Store } from "./store.js";
+import {
+  buildTeamReport,
+  formatLease,
+  formatPlan,
+  leasePressure,
+  Team,
+  type Complexity,
+  type LeaseOutcome,
+} from "./team.js";
 import { aggregateUsage, parseDuration } from "./telemetry.js";
 
 /** Tokens limitbreak saved (compression + shaping + dropped context) in the last `ms`. */
 function savedTokensSince(logPath: string, ms: number): number {
   const r = aggregateUsage(logPath, { sinceMs: Date.now() - ms });
   return r.compressionSavedTokens + r.shapingSavedTokens + r.droppedContextTokens;
+}
+
+const COMPLEXITIES = new Set<Complexity>(["trivial", "small", "medium", "large"]);
+const OUTCOMES = new Set<LeaseOutcome>(["accepted", "rejected", "failed"]);
+
+/**
+ * Tokens still available in the tightest quota window — the pool a team is
+ * actually staffed against. Staffing off remaining quota rather than a fixed
+ * number is the whole point: the same goal gets a full roster at the start of a
+ * window and a merged pair near the wall.
+ */
+function remainingTokens(logPath: string, configPath: string): number {
+  const settings = loadSettings(configPath);
+  const ledger = new Ledger(logPath);
+  const eff = ledger.effectiveSettings(settings);
+  const worst = assess(ledger.forecasts(eff), eff).worst;
+  if (!worst) return 0;
+  return Math.max(0, worst.window.budgetTokens - worst.usedTokens);
 }
 
 const KNOWN_PROTOCOL_VERSIONS = new Set([
@@ -109,6 +136,96 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "limitbreak_team_plan",
+    description:
+      "Staff a multi-agent run: decides how many agents to use, which roles, and how many tokens each gets, sized against your REMAINING quota. Call this before spawning any subagents. Returns a roster with a lease id per agent — pass each agent its own lease id so its usage is metered separately. Refuses up front when the budget cannot fund a viable team, so you find out before spending anything.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        goal: { type: "string", description: "What the team is being asked to deliver" },
+        complexity: {
+          type: "string",
+          enum: ["trivial", "small", "medium", "large"],
+          description:
+            "trivial = one file, no design choice (1 agent); small = 2; medium = 3; large = full roster. Err small — a reviewer on a one-line change is pure overhead.",
+        },
+        parallelWidth: {
+          type: "number",
+          description:
+            "Count of genuinely INDEPENDENT work units, for developer fan-out. 1 means a single chain. Do not inflate this: extra agents are capped by budget and each one costs a handoff.",
+        },
+        availableTokens: {
+          type: "number",
+          description:
+            "Tokens the team may draw on. Omit to use remaining quota in the tightest window (the usual choice).",
+        },
+        dryRun: {
+          type: "boolean",
+          description: "Plan without opening leases, to compare options first.",
+        },
+      },
+      required: ["goal"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "limitbreak_lease_spend",
+    description:
+      "Report tokens consumed against your lease and get back your remaining budget. Call this after finishing a significant chunk of work. The reply tells you whether to keep going, converge, or checkpoint immediately — obey it: a lease that runs out mid-task wastes everything it already spent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Your 12-character lease id" },
+        tokens: { type: "number", description: "Tokens consumed since the last report" },
+      },
+      required: ["id", "tokens"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "limitbreak_lease_close",
+    description:
+      "Close your lease when your work is done, reporting the outcome. Unspent budget returns to the pool and can fund another agent, so always close rather than leaving a lease open. The outcome is what teaches the estimator, so report it honestly.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Your 12-character lease id" },
+        outcome: {
+          type: "string",
+          enum: ["accepted", "rejected", "failed"],
+          description:
+            "accepted = delivered what was asked; rejected = delivered but the reviewer sent it back; failed = could not complete",
+        },
+      },
+      required: ["id", "outcome"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "limitbreak_team_status",
+    description:
+      "Live state of a multi-agent run: every agent's lease, spend against grant, pressure level, and the budget reclaimable at the next phase boundary. Call this between phases to decide whether to hire, merge, or stop.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        runId: { type: "string", description: "Run id from limitbreak_team_plan. Omit for all runs." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "limitbreak_team_report",
+    description:
+      "Efficiency report for multi-agent runs: accepted work per 100k tokens, per-role spend, estimate-to-actual ratios (which roles overrun), manager coordination overhead, and budget reclaimed from unspent leases.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        runId: { type: "string", description: "Limit to one run. Omit for all time." },
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 function packageVersion(): string {
@@ -140,6 +257,7 @@ export function createMcpHandler(deps?: {
   const dir = deps?.configDir ?? defaultConfigDir();
   const logPath = () => join(dir, "usage.jsonl");
   const configPath = () => join(dir, "config.json");
+  const teamPath = () => join(dir, "team.jsonl");
 
   function callTool(name: string, args: Record<string, unknown>): unknown {
     switch (name) {
@@ -222,6 +340,119 @@ export function createMcpHandler(deps?: {
         }
         const r = aggregateUsage(logPath(), { sinceMs, pricing: loadSettings(configPath()).pricing });
         return toolText(JSON.stringify(r, null, 2));
+      }
+      case "limitbreak_team_plan": {
+        if (typeof args.goal !== "string" || !args.goal.trim()) {
+          return toolText('limitbreak_team_plan requires a non-empty string "goal" argument', true);
+        }
+        let complexity: Complexity = "medium";
+        if (args.complexity !== undefined) {
+          if (typeof args.complexity !== "string" || !COMPLEXITIES.has(args.complexity as Complexity)) {
+            return toolText(
+              `invalid "complexity" — use one of ${[...COMPLEXITIES].join(", ")}`,
+              true,
+            );
+          }
+          complexity = args.complexity as Complexity;
+        }
+        const settings = loadSettings(configPath());
+        const team = new Team(teamPath(), settings.team);
+        const available =
+          typeof args.availableTokens === "number" && args.availableTokens > 0
+            ? Math.floor(args.availableTokens)
+            : remainingTokens(logPath(), configPath());
+        const plan = team.plan({
+          goal: args.goal,
+          complexity,
+          ...(typeof args.parallelWidth === "number" && { parallelWidth: args.parallelWidth }),
+          availableTokens: available,
+        });
+        const lines = [`pool: ${available} tokens available`, formatPlan(plan)];
+        if (!plan.feasible) {
+          lines.push(
+            "",
+            "Do not spawn agents. Cut the scope, wait for the window to recover, or pass availableTokens deliberately.",
+          );
+          return toolText(lines.join("\n"), true);
+        }
+        if (args.dryRun === true) {
+          lines.push("", "dry run — no leases opened");
+          return toolText(lines.join("\n"));
+        }
+        const leases = team.openPlan(plan);
+        lines.push("", "Give each agent its own lease id, and only that one:");
+        for (const l of leases) {
+          lines.push(`  ${l.role} → lease ${l.id} · ${l.granted} tokens · phase ${l.phase}`);
+        }
+        return toolText(lines.join("\n"));
+      }
+      case "limitbreak_lease_spend": {
+        if (typeof args.id !== "string") {
+          return toolText('limitbreak_lease_spend requires a string "id" argument', true);
+        }
+        if (typeof args.tokens !== "number" || !Number.isFinite(args.tokens)) {
+          return toolText('limitbreak_lease_spend requires a numeric "tokens" argument', true);
+        }
+        const settings = loadSettings(configPath());
+        try {
+          const { lease, pressure, steer } = new Team(teamPath(), settings.team).spend(
+            args.id,
+            args.tokens,
+          );
+          const left = Math.max(0, lease.granted - lease.spent);
+          const out = [
+            `${lease.role}: ${lease.spent}/${lease.granted} tokens used, ~${left} left — ${pressure.toUpperCase()}`,
+          ];
+          if (steer) out.push(steer);
+          // A stop verdict is returned as an error so the calling agent treats it
+          // as a hard signal rather than advisory prose it may talk itself past.
+          return toolText(out.join("\n"), pressure === "stop");
+        } catch (err) {
+          return toolText(String(err instanceof Error ? err.message : err), true);
+        }
+      }
+      case "limitbreak_lease_close": {
+        if (typeof args.id !== "string") {
+          return toolText('limitbreak_lease_close requires a string "id" argument', true);
+        }
+        if (typeof args.outcome !== "string" || !OUTCOMES.has(args.outcome as LeaseOutcome)) {
+          return toolText(`invalid "outcome" — use one of ${[...OUTCOMES].join(", ")}`, true);
+        }
+        const settings = loadSettings(configPath());
+        const closed = new Team(teamPath(), settings.team).close(
+          args.id,
+          args.outcome as LeaseOutcome,
+        );
+        if (!closed) return toolText(`no open lease ${args.id}`, true);
+        const unspent = Math.max(0, closed.granted - closed.spent);
+        return toolText(
+          `closed ${formatLease(closed)}` +
+            (unspent > 0 ? `\n${unspent} tokens returned to the pool` : ""),
+        );
+      }
+      case "limitbreak_team_status": {
+        const settings = loadSettings(configPath());
+        const team = new Team(teamPath(), settings.team);
+        const runId = typeof args.runId === "string" ? args.runId : undefined;
+        const leases = team.leases(runId);
+        if (leases.length === 0) return toolText("no team leases recorded");
+        const out = leases.map(
+          (l) => `${formatLease(l)} [${leasePressure(l, settings.team)}]`,
+        );
+        if (runId) {
+          const { tokens, leases: done } = team.reclaimable(runId);
+          out.push(
+            `reclaimable at next boundary: ${tokens} tokens from ${done.length} finished lease(s)`,
+          );
+        }
+        return toolText(out.join("\n"));
+      }
+      case "limitbreak_team_report": {
+        const settings = loadSettings(configPath());
+        const leases = new Team(teamPath(), settings.team).leases(
+          typeof args.runId === "string" ? args.runId : undefined,
+        );
+        return toolText(JSON.stringify(buildTeamReport(leases), null, 2));
       }
       default:
         return toolText(`unknown tool: ${name}`, true);

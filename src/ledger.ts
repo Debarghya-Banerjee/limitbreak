@@ -5,6 +5,7 @@ import type { CompressionBackendSetting } from "./backends.js";
 import { calibrateBudgets, effectiveWindows, type CalibratedBudget } from "./calibrate.js";
 import type { Intensity } from "./compress.js";
 import { DEFAULT_GUARDRAILS, type GuardrailConfig } from "./guardrails.js";
+import { DEFAULT_TEAM, type TeamConfig } from "./team.js";
 import { appendRecord, recordUsage, type UsageRecord } from "./telemetry.js";
 
 export interface QuotaWindow {
@@ -36,6 +37,8 @@ export interface GovernorSettings {
   autoCalibrate: boolean;
   /** Auto-revert a policy that measurably regresses vs the holdout. */
   guardrails: GuardrailConfig;
+  /** Headcount and per-agent budget policy for multi-agent runs. */
+  team: TeamConfig;
   /**
    * Optional $/MTok overrides keyed by model id: { "model": [input, output] }.
    * Dollar cost is opt-in — the governor runs on tokens, not dollars, so this is
@@ -84,6 +87,7 @@ export const DEFAULT_SETTINGS: GovernorSettings = {
   compressionBackend: "builtin",
   autoCalibrate: true,
   guardrails: DEFAULT_GUARDRAILS,
+  team: DEFAULT_TEAM,
   pricing: {},
   upstreams: {
     anthropic: "https://api.anthropic.com",
@@ -106,6 +110,7 @@ export function loadSettings(
       ...user,
       compression: { ...DEFAULT_SETTINGS.compression, ...user.compression },
       guardrails: { ...DEFAULT_SETTINGS.guardrails, ...user.guardrails },
+      team: { ...DEFAULT_SETTINGS.team, ...user.team },
       pricing: { ...DEFAULT_SETTINGS.pricing, ...user.pricing },
       upstreams: { ...DEFAULT_SETTINGS.upstreams, ...user.upstreams },
       windowsExplicit: Array.isArray(user.windows),

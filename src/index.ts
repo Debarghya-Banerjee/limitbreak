@@ -36,6 +36,32 @@ export type { CompressionBackend, ExternalBackendConfig, CompressionBackendSetti
 export { Store } from "./store.js";
 export { Memory, formatEntry, MEMORY_TEXT_LIMIT } from "./memory.js";
 export type { MemoryEntry } from "./memory.js";
+export {
+  Team,
+  buildTeamReport,
+  formatLease,
+  formatPlan,
+  leasePressure,
+  leaseSteer,
+  DEFAULT_ROLES,
+  DEFAULT_TEAM,
+} from "./team.js";
+export type {
+  Complexity,
+  Lease,
+  LeaseOutcome,
+  LeasePressure,
+  LeaseState,
+  PriorityClass,
+  RoleEstimate,
+  RoleReport,
+  RoleSpec,
+  RosterEntry,
+  StaffingPlan,
+  StaffingRequest,
+  TeamConfig,
+  TeamReport,
+} from "./team.js";
 
 const ADAPTERS: Record<string, Adapter> = {
   anthropic: anthropicAdapter,
